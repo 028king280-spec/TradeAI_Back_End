@@ -13,19 +13,55 @@ Never combines or hides MISSED, EXPIRED, CANCELLED, UNRESOLVED, DATA_GAP, or AMB
 
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc, case
+from sqlalchemy import select, func
 import io
 import csv
 
 from app.db.database import get_db
-from app.models.db_models import SignalRecord, SignalEventRecord, PerformanceSnapshotRecord
+from app.models.db_models import SignalRecord, SignalEventRecord, PerformanceSnapshotRecord, SignalEvaluationRecord
 from app.schemas.market import ApiResponse
 from app.data.market_calendar import MarketCalendar
 
 router = APIRouter(prefix="/performance", tags=["Performance & Daily Audit"])
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def ist_day_bounds(day):
+    start = datetime(day.year, day.month, day.day, tzinfo=IST).astimezone(timezone.utc)
+    return start, (datetime(day.year, day.month, day.day, tzinfo=IST) + timedelta(days=1)).astimezone(timezone.utc)
+
+
+@router.get("/evaluations")
+async def get_signal_evaluations(
+    date: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_db),
+):
+    """Observed pipeline evaluations; separate from generated signals and paper fills."""
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date() if date else MarketCalendar.now_ist().date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    start, end = ist_day_bounds(day)
+    query = select(SignalEvaluationRecord).where(
+        SignalEvaluationRecord.evaluated_at >= start,
+        SignalEvaluationRecord.evaluated_at < end,
+    )
+    if symbol:
+        query = query.where(SignalEvaluationRecord.symbol == symbol)
+    count = (await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+    records = (await session.execute(query.order_by(SignalEvaluationRecord.evaluated_at.desc()).limit(500))).scalars().all()
+    return {"date": day.isoformat(), "evaluations": [
+        {"timeUtc": r.evaluated_at.replace(tzinfo=timezone.utc).isoformat(),
+         "symbol": r.symbol, "dataStatus": r.data_status, "action": r.action,
+         "qualified": r.qualified, "reasons": r.rejection_reasons,
+         "stages": r.stage_status, "persistedSignalId": r.persisted_signal_id}
+        for r in records
+    ], "count": count, "limit": 500}
 
 
 def format_duration(seconds: float) -> str:
@@ -66,8 +102,7 @@ async def get_daily_performance(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    start_dt = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
-    end_dt = start_dt + timedelta(days=1)
+    start_dt, end_dt = ist_day_bounds(target_date)
 
     # Query signals created on this date
     q = select(SignalRecord).where(
@@ -317,34 +352,27 @@ async def get_performance_history(
     """
     Returns high-level daily summary table for historical date browsing.
     """
-    # Fetch distinct dates with signals
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(days=days)
-
-    q = select(
-        func.date(SignalRecord.created_at).label("signal_date"),
-        func.count(SignalRecord.id).label("total"),
-        func.sum(case((SignalRecord.option_type == "CE", 1), else_=0)).label("calls"),
-        func.sum(case((SignalRecord.option_type == "PE", 1), else_=0)).label("puts"),
-        func.sum(case((SignalRecord.entry_triggered_at != None, 1), else_=0)).label("triggered"),
-        func.sum(case((SignalRecord.status.in_(["TARGET_1_HIT", "TARGET_2_HIT", "TARGET_3_HIT"]), 1), else_=0)).label("t1_hits"),
-        func.sum(case((SignalRecord.status == "STOP_LOSS_HIT", 1), else_=0)).label("sl_hits"),
-        func.sum(case((SignalRecord.net_pnl_inr > 0, 1), else_=0)).label("wins"),
-        func.sum(SignalRecord.net_pnl_inr).label("total_net_pnl"),
-    ).where(SignalRecord.created_at >= cutoff).group_by(func.date(SignalRecord.created_at)).order_by(desc("signal_date"))
-
-    res = await session.execute(q)
-    rows = res.all()
-
+    today = MarketCalendar.now_ist().date()
+    cutoff, _ = ist_day_bounds(today - timedelta(days=days - 1))
+    _, end = ist_day_bounds(today)
+    rows = (await session.execute(select(SignalRecord).where(
+        SignalRecord.created_at >= cutoff, SignalRecord.created_at < end,
+    ))).scalars().all()
+    by_day = {}
+    for signal in rows:
+        created = signal.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        date_key = created.astimezone(IST).date().isoformat()
+        by_day.setdefault(date_key, []).append(signal)
     summary_list = []
-    for r in rows:
-        d_str = str(r.signal_date)
-        tot = r.total or 0
-        trig = r.triggered or 0
-        t1 = r.t1_hits or 0
-        sl = r.sl_hits or 0
-        wins = r.wins or 0
-        pnl = round(float(r.total_net_pnl or 0.0), 2)
+    for d_str, signals in sorted(by_day.items(), reverse=True):
+        tot = len(signals)
+        trig = sum(s.entry_triggered_at is not None for s in signals)
+        t1 = sum(s.status in ("TARGET_1_HIT", "TARGET_2_HIT", "TARGET_3_HIT") for s in signals)
+        sl = sum(s.status == "STOP_LOSS_HIT" for s in signals)
+        wins = sum(s.net_pnl_inr is not None and s.net_pnl_inr > 0 for s in signals)
+        pnl = round(sum(float(s.net_pnl_inr or 0) for s in signals), 2)
 
         win_rate = f"{round((wins / trig * 100.0), 1)}% ({wins}/{trig})" if trig > 0 else "N/A"
         t1_rate = f"{round((t1 / trig * 100.0), 1)}% ({t1}/{trig})" if trig > 0 else "N/A"
@@ -353,8 +381,8 @@ async def get_performance_history(
         summary_list.append({
             "date": d_str,
             "totalSignals": tot,
-            "calls": r.calls or 0,
-            "puts": r.puts or 0,
+            "calls": sum(s.option_type == "CE" for s in signals),
+            "puts": sum(s.option_type == "PE" for s in signals),
             "triggeredEntries": trig,
             "t1Hits": t1,
             "slHits": sl,
@@ -463,3 +491,68 @@ async def export_daily_performance_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=aivolve_signals_{date}.csv"}
     )
+
+
+@router.get("/research-evaluations")
+async def get_research_evaluations(
+    date: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db),
+):
+    """Paginated research observations, separate from production performance."""
+    from app.models.db_models import ResearchSetupEvaluationRecord
+    from app.options.research_setup_engine import ENGINE_ID
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date() if date else MarketCalendar.now_ist().date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    start, end = ist_day_bounds(day)
+    query = select(ResearchSetupEvaluationRecord).where(
+        ResearchSetupEvaluationRecord.engine_id == ENGINE_ID,
+        ResearchSetupEvaluationRecord.evaluated_at >= start,
+        ResearchSetupEvaluationRecord.evaluated_at < end,
+    )
+    if symbol:
+        query = query.where(ResearchSetupEvaluationRecord.symbol == symbol)
+    count = (await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+    rows = (await session.execute(query.order_by(
+        ResearchSetupEvaluationRecord.evaluated_at.desc(), ResearchSetupEvaluationRecord.id
+    ).offset(offset).limit(limit))).scalars().all()
+    return {"engineId": ENGINE_ID, "date": day.isoformat(), "count": count,
+            "limit": limit, "offset": offset, "evaluations": [row.payload for row in rows]}
+
+
+@router.get("/research-paper")
+async def get_research_paper(session: AsyncSession = Depends(get_db)):
+    """Read-only separate simulated account; no reset or order mutation endpoint."""
+    from app.models.db_models import ResearchPaperAccount, ResearchPaperTrade
+    from app.options.research_paper_engine import ENGINE_ID, INITIAL_CASH, FEE, SLIPPAGE_BPS
+    from app.jobs.research_paper import entries_enabled
+    account = await session.get(ResearchPaperAccount, ENGINE_ID)
+    rows = list((await session.execute(select(ResearchPaperTrade).where(
+        ResearchPaperTrade.engine_id == ENGINE_ID
+    ).order_by(ResearchPaperTrade.opened_at.desc()).limit(100))).scalars())
+    net = (await session.execute(select(func.coalesce(func.sum(ResearchPaperTrade.net_pnl_paise), 0)).where(
+        ResearchPaperTrade.engine_id == ENGINE_ID, ResearchPaperTrade.status == 'CLOSED'
+    ))).scalar_one()
+    count = (await session.execute(select(func.count()).select_from(ResearchPaperTrade).where(
+        ResearchPaperTrade.engine_id == ENGINE_ID
+    ))).scalar_one()
+    return {"engineId": ENGINE_ID, "initialized": account is not None,
+            "autoEntryEnabled": entries_enabled(), "initialCash": (account.initial_cash_paise if account else INITIAL_CASH) / 100,
+            "availableCash": account.cash_paise / 100 if account else None,
+            "realizedNetPnl": net / 100, "totalTrades": count,
+            "costModel": {"feePerSide": FEE / 100, "slippageBps": SLIPPAGE_BPS,
+                          "excludes": "GST and other statutory charges"},
+            "trades": [{"id": row.id, "evaluationId": row.evaluation_id, "symbol": row.symbol,
+                        "contract": row.contract_symbol, "quantity": row.quantity, "status": row.status,
+                        "entry": row.entry_paise / 100, "target": row.target_paise / 100,
+                        "stop": row.stop_paise / 100, "exit": row.exit_paise / 100 if row.exit_paise is not None else None,
+                        "exitReason": row.exit_reason, "netPnl": row.net_pnl_paise / 100 if row.net_pnl_paise is not None else None,
+                        "monitoring": row.monitoring_status, "hadDataGap": row.had_data_gap,
+                        "openedAt": row.opened_at.replace(tzinfo=timezone.utc).isoformat(),
+                        "closedAt": row.closed_at.replace(tzinfo=timezone.utc).isoformat() if row.closed_at else None,
+                        "lastQuoteAt": row.last_quote_at.replace(tzinfo=timezone.utc).isoformat() if row.last_quote_at else None,
+                        } for row in rows]}

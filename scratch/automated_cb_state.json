@@ -1,0 +1,24 @@
+{
+  "configuredBudgetINR": 10000.0,
+  "budgetApprovedBy": "SYSTEM_OPERATOR",
+  "budgetApprovalReference": "OP-AUTH-2026-11-16",
+  "budgetApprovalReason": "Automated Paper Trading Session (2026-11-16)",
+  "budgetApprovalDate": "16 Nov 2026, 01:49 PM IST",
+  "activeBreach": null,
+  "historicalBreaches": [],
+  "configurationAuditLog": [
+    {
+      "id": "CFG-E002243B",
+      "timestamp": "16 Nov 2026, 01:49 PM IST",
+      "actor": "SYSTEM_OPERATOR",
+      "approvalReference": "OP-AUTH-2026-11-16",
+      "reason": "Automated Paper Trading Session (2026-11-16)",
+      "action": "CONFIGURE_BUDGET",
+      "outcome": "SUCCESS",
+      "previousBudgetINR": null,
+      "newBudgetINR": 10000.0
+    }
+  ],
+  "consumedApprovalReferences": [],
+  "lastUpdated": "16 Nov 2026, 01:49 PM IST"
+}
