@@ -576,6 +576,8 @@ async def get_index_full_analysis(index_symbol: str, session: AsyncSession = Dep
     try:
         from app.options.drawdown_circuit_breaker import get_circuit_breaker
         from app.options.paper_trading.paper_engine import paper_engine
+        from app.api.routes.paper_trading import _refresh_open_positions_live_quotes
+        await _refresh_open_positions_live_quotes()
         cb_instance = get_circuit_breaker()
         cb_status = cb_instance.get_status(paper_engine.state)
         if not cb_status.get("isPermitted", False):
@@ -1242,7 +1244,7 @@ async def run_ict_backtest(
     algorithm_type = payload.get("algorithmType", "COMBINED_ICT_SMC")
     slippage_pts = float(payload.get("slippagePts", 2.0))
     brokerage = float(payload.get("brokeragePerTrade", 40.0))
-    lot_size = int(payload.get("lotSize", 65 if "NIFTY" in clean else 15))
+    lot_size = int(payload.get("lotSize", 30 if "BANK" in clean else (60 if "FIN" in clean else 65)))
 
     df = await provider.get_intraday_candles(clean, timeframe)
     df_attrs = df.attrs if (df is not None and hasattr(df, "attrs")) else {}
